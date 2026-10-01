@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!--
+      ================================================================
+      * WMS Smart Replenishment System v2.8.5 (Auth + Putaway FIFO Edition)
+      * Author: Logistics Tech Team
+      * License: Confidential & Proprietary - Internal Warehouse Use Only
+      * Copyright (c) 2026 All Rights Reserved.
+      ================================================================
+    -->
+    <title>WMS 智能補貨系統 (入庫上架流水 FIFO)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.3.2/papaparse.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    <style>
+        .watermark-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            pointer-events: none;
+            z-index: 9999;
+            opacity: 0.03;
+            background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='300' height='200'><text x='20' y='100' fill='%23000' font-size='16' font-family='monospace' transform='rotate(-25 100 100)'>WMS INTERNAL SYSTEM - CONFIDENTIAL</text></svg>");
+            background-repeat: repeat;
+        }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-800">
+    <div class="watermark-overlay"></div>
+
+    <div id="app" class="min-h-screen relative">
+
+        <!-- 登入彈窗 Modal -->
+        <div v-if="!isLoggedIn" class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[10000] flex items-center justify-center p-4">
+            <div class="bg-white rounded-2xl shadow-2xl p-6 md:p-8 max-w-sm w-full border border-slate-100">
+                <div class="text-center mb-6">
+                    <div class="w-12 h-12 bg-indigo-100 text-indigo-600 rounded-full flex items-center justify-center mx-auto mb-3 text-xl font-bold">🔐</div>
+                    <h2 class="text-xl font-bold text-slate-900">WMS 系統身分驗證</h2>
+                    <p class="text-xs text-slate-500 mt-1">請輸入操作人員帳號與密碼以繼續</p>
+                </div>
+                
+                <form @submit.prevent="handleLogin" class="space-y-4">
+                    <div>
+                        <label class="block text-xs font-semibold text-slate-700 mb-1">使用者帳號</label>
+                        <input type="text" v-model="loginForm.username" required placeholder="請輸入帳號" class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-semibold text-slate-700 mb-1">密碼</label>
+                        <input type="password" v-model="loginForm.password" required placeholder="請輸入密碼" class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+                    </div>
+                    
+                    <p v-if="loginError" class="text-xs text-rose-600 font-medium text-center">{{ loginError }}</p>
+
+                    <button type="submit" class="w-full py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-semibold text-sm transition shadow-sm">
+                        安全登入
+                    </button>
+                </form>
+            </div>
+        </div>
+
+        <!-- 主要系統內容 -->
+        <div v-else class="p-4 md:p-6 max-w-7xl mx-auto space-y-6">
+            
+            <!-- Header -->
+            <header class="flex flex-col md:flex-row justify-between items-start md:items-center border-b pb-4 border-slate-200">
+                <div>
+                    <h1 class="text-2xl font-bold text-slate-900">📦 WMS 高位下架補貨管理系統 <span class="text-xs bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded-full font-mono ml-2">v2.8.5 FIFO</span></h1>
+                    <p class="text-sm text-slate-500">以 <strong>Barcode / SKU</strong> 為主鍵 | 篩選 <strong>入庫上架</strong> 流水 | 依 <strong>操作時間 FIFO</strong> 排序</p>
+                </div>
+                <div class="mt-4 md:mt-0 flex items-center gap-3">
+                    <span class="text-xs font-medium text-slate-500">👤 登入者: <strong class="text-slate-800">{{ currentUser }}</strong></span>
+                    <button @click="handleLogout" class="px-2.5 py-1 border border-slate-300 text-slate-600 hover:bg-slate-100 rounded-lg text-xs font-medium transition">
+                        登出
+                    </button>
+                    <button @click="exportCSV" :disabled="!replenishList.length" 
+                        class="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded-lg font-medium text-sm transition shadow-sm">
+                        📥 導出簡化補貨任務單 ({{ replenishList.length }})
+                    </button>
+                </div>
+            </header>
+
+            <!-- Controls -->
+            <div class="grid grid-cols-1 md:grid-cols-5 gap-3">
+                <!-- 1. 庫存檔 -->
+                <div class="bg-white p-3.5 rounded-xl border border-slate-200 shadow-sm">
+                    <label class="block text-xs font-semibold mb-1 text-slate-700">1. 上傳庫存檔案 (.xlsx/.csv)</label>
+                    <input type="file" @change="handleStockUpload" accept=".csv, .xlsx, .xls" class="block w-full text-[11px] text-slate-500 file:mr-2 file:py-1 file:px-2 file:rounded-lg file:border-0 file:text-[11px] file:font-semibold file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100 cursor-pointer"/>
+                    <p class="text-[11px] text-indigo-600 mt-1 font-medium" v-if="stockData.length">✓ 已載入 {{ stockData.length }} 筆庫存</p>
+                </div>
+
+                <!-- 2. 昨日出貨檔 -->
+                <div class="bg-white p-3.5 rounded-xl border border-slate-200 shadow-sm">
+                    <label class="block text-xs font-semibold mb-1 text-slate-700">2. 上傳昨日出貨流水 (可選)</label>
+                    <input type="file" @change="handleSalesUpload" accept=".csv, .xlsx, .xls" class="block w-full text-[11px] text-slate-500 file:mr-2 file:py-1 file:px-2 file:rounded-lg file:border-0 file:text-[11px] file:font-semibold file:bg-amber-50 file:text-amber-700 hover:file:bg-amber-100 cursor-pointer"/>
+                    <p class="text-[11px] text-amber-600 mt-1 font-medium" v-if="Object.keys(salesMap).length">✓ 已對應 {{ Object.keys(salesMap).length }} 項流水</p>
+                </div>
+
+                <!-- 3. 上架流水檔 (過濾入庫上架 + 操作時間) -->
+                <div class="bg-white p-3.5 rounded-xl border border-slate-200 shadow-sm border-indigo-200 bg-indigo-50/20">
+                    <label class="block text-xs font-semibold mb-1 text-indigo-900 flex items-center gap-1">
+                        3. 上架流水 (入庫上架/操作時間)
+                    </label>
+                    <input type="file" @change="handlePutawayUpload" accept=".csv, .xlsx, .xls" class="block w-full text-[11px] text-slate-500 file:mr-2 file:py-1 file:px-2 file:rounded-lg file:border-0 file:text-[11px] file:font-semibold file:bg-purple-50 file:text-purple-700 hover:file:bg-purple-100 cursor-pointer"/>
+                    <p class="text-[11px] text-purple-600 mt-1 font-medium" v-if="putawayCount > 0">✓ 已讀取 {{ putawayCount }} 筆入庫上架紀錄</p>
+                </div>
+
+                <!-- 4. 排除庫位 -->
+                <div class="bg-white p-3.5 rounded-xl border border-slate-200 shadow-sm">
+                    <label class="block text-xs font-semibold mb-1 text-slate-700">4. 排除庫位 (關鍵字)</label>
+                    <input type="text" v-model="excludeInput" placeholder="以逗號分隔..." class="w-full border border-slate-300 rounded-lg px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-indigo-500"/>
+                    <p class="text-[10px] text-slate-400 mt-1 truncate" :title="excludeList.join(', ')">排除: {{ excludeList.join(', ') || '無' }}</p>
+                </div>
+
+                <!-- 5. 警戒線 -->
+                <div class="bg-white p-3.5 rounded-xl border border-slate-200 shadow-sm">
+                    <div class="flex justify-between items-center mb-1">
+                        <label class="block text-xs font-semibold text-slate-700">5. 地下警戒線</label>
+                        <div class="flex items-center gap-0.5">
+                            <input type="number" min="0" max="100" v-model.number="thresholdPercent" class="w-10 border rounded px-1 py-0.5 text-right font-bold text-rose-600 text-xs focus:outline-none"/>
+                            <span class="text-xs font-bold text-rose-600">%</span>
+                        </div>
+                    </div>
+                    <input type="range" min="0" max="100" step="1" v-model.number="thresholdPercent" class="w-full cursor-pointer"/>
+                    <p class="text-[10px] text-slate-400 mt-0.5">佔比 &lt; {{ thresholdPercent }}% 觸發補貨</p>
+                </div>
+            </div>
+
+            <!-- Metrics -->
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-4" v-if="stockData.length">
+                <div class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
+                    <span class="text-xs text-slate-500 font-medium">獨立 Barcode 數</span>
+                    <p class="text-2xl font-bold text-slate-800 mt-1">{{ totalSKUs }}</p>
+                </div>
+                <div class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
+                    <span class="text-xs text-slate-500 font-medium">地下可用總庫存 (`-01`)</span>
+                    <p class="text-2xl font-bold text-indigo-600 mt-1">{{ totalGroundStock.toLocaleString() }}</p>
+                </div>
+                <div class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
+                    <span class="text-xs text-rose-600 font-medium">觸發補貨 Barcode 數</span>
+                    <p class="text-2xl font-bold text-rose-600 mt-1">{{ replenishList.length }}</p>
+                </div>
+                <div class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
+                    <span class="text-xs text-emerald-600 font-medium">總建議精準下架量</span>
+                    <p class="text-2xl font-bold text-emerald-600 mt-1">{{ totalSuggestedReplenish.toLocaleString() }}</p>
+                </div>
+            </div>
+
+            <!-- Table -->
+            <div class="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden" v-if="stockData.length">
+                <div class="p-4 border-b border-slate-100 flex flex-col md:flex-row justify-between items-start md:items-center gap-3 bg-rose-50/40">
+                    <h2 class="font-bold text-slate-800 text-base flex items-center gap-2">
+                        🚨 地下補貨任務清單 (地下可用佔比 &lt; {{ thresholdPercent }}%)
+                    </h2>
+                    <div class="flex items-center gap-3">
+                        <span class="text-xs text-rose-600 font-medium bg-rose-100 px-2.5 py-1 rounded-full border border-rose-200">
+                            🔴 總庫存 &gt; 100 件
+                        </span>
+                        <button @click="sortBySales = !sortBySales" class="px-3 py-1 bg-amber-50 text-amber-700 border border-amber-300 rounded-lg text-xs font-semibold hover:bg-amber-100">
+                            {{ sortBySales ? '🔄 切換為預設排序' : '🔥 按昨日出貨量排序' }}
+                        </button>
+                        <input type="text" v-model="search" placeholder="搜尋 Barcode / SKU / 品名..." class="border rounded-lg px-3 py-1 text-xs w-56 focus:outline-none"/>
+                    </div>
+                </div>
+                <div class="overflow-x-auto max-h-[550px]">
+                    <table class="w-full text-xs text-left border-collapse">
+                        <thead class="bg-slate-50 text-slate-500 sticky top-0 border-b border-slate-200 shadow-sm">
+                            <tr>
+                                <th class="p-2.5">Barcode</th>
+                                <th class="p-2.5">SKU 編碼</th>
+                                <th class="p-2.5">品名</th>
+                                <th class="p-2.5 bg-amber-50 text-amber-900 font-bold">昨日出貨量</th>
+                                <th class="p-2.5 bg-blue-50 text-blue-900 font-bold">已分配待出</th>
+                                <th class="p-2.5">總可用庫存</th>
+                                <th class="p-2.5">地下可用 (`-01`)</th>
+                                <th class="p-2.5">地下佔比</th>
+                                <th class="p-2.5 bg-emerald-50 text-emerald-900 font-bold">建議下架量</th>
+                                <th class="p-2.5 bg-indigo-50 text-indigo-900 font-bold min-w-[240px]">建議下架庫位 (入庫上架 FIFO)</th>
+                            </tr>
+                        </thead>
+                        <tbody class="divide-y divide-slate-100">
+                            <tr v-for="item in filteredList" :key="item.barcode" 
+                                :class="item.totalStock > 100 ? 'bg-rose-50/60 hover:bg-rose-100/60' : 'hover:bg-slate-50'">
+                                <td class="p-2.5 font-mono font-bold text-indigo-600">{{ item.barcode }}</td>
+                                <td class="p-2.5 font-mono text-slate-600">{{ item.sku }}</td>
+                                <td class="p-2.5 max-w-xs truncate" :title="item.name">{{ item.name }}</td>
+                                <td class="p-2.5 bg-amber-50/50 font-bold" :class="item.yesterdaySales > 0 ? 'text-amber-700 text-sm' : 'text-slate-400'">
+                                    {{ item.yesterdaySales }}
+                                    <span v-if="item.yesterdaySales > 0" class="text-[10px] text-amber-600 font-normal">件</span>
+                                </td>
+                                <td class="p-2.5 bg-blue-50/50 font-bold" :class="item.allocatedPending > 0 ? 'text-blue-600 text-sm' : 'text-slate-400'">
+                                    {{ item.allocatedPending }}
+                                    <span v-if="item.allocatedPending > 0" class="text-[10px] text-blue-500 font-normal">件</span>
+                                </td>
+                                <td class="p-2.5 font-semibold" :class="item.totalStock > 100 ? 'text-rose-600 font-bold text-sm' : 'text-slate-800'">
+                                    {{ item.totalStock }}
+                                    <span v-if="item.totalStock > 100" class="inline-block ml-0.5 text-xs">🔥</span>
+                                </td>
+                                <td class="p-2.5 font-bold" :class="item.groundStock === 0 ? 'text-rose-600' : 'text-slate-800'">
+                                    {{ item.groundStock }}
+                                </td>
+                                <td class="p-2.5">
+                                    <span class="px-2 py-0.5 rounded font-bold" :class="item.groundRatio === 0 ? 'bg-rose-100 text-rose-700' : 'bg-amber-100 text-amber-700'">
+                                        {{ (item.groundRatio * 100).toFixed(1) }}%
+                                    </span>
+                                </td>
+                                <td class="p-2.5 font-bold text-emerald-600 bg-emerald-50/40 text-sm">
+                                    +{{ item.suggestedReplenish }}
+                                </td>
+                                <!-- 建議下架庫位 (入庫上架 FIFO) -->
+                                <td class="p-2.5 bg-indigo-50/30">
+                                    <div class="flex flex-wrap gap-1.5">
+                                        <span v-for="(plan, idx) in item.pickPlan" :key="idx" 
+                                            class="inline-flex items-center bg-white border border-indigo-200 text-indigo-900 px-2 py-0.5 rounded shadow-sm text-[11px] font-mono font-bold"
+                                            :title="plan.opTime ? '操作時間: ' + plan.opTime : '無流水紀錄 (按庫位層級 FIFO)'">
+                                            {{ plan.loc }}
+                                            <span v-if="plan.opTime" class="ml-1 text-[9px] text-purple-600">🕒</span>
+                                        </span>
+                                    </div>
+                                </td>
+                            </tr>
+                            <tr v-if="!filteredList.length">
+                                <td colspan="10" class="p-6 text-center text-slate-400">當前門檻下無觸發補貨項目 🎉</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+        </div>
+
+    </div>
+
+    <script>
+        const { createApp, ref, computed } = Vue;
+
+        // 登入驗證預設帳密
+        const AUTH_CONFIG = {
+            username: "SVHK",
+            password: "6186"
+        };
+
+        createApp({
+            setup() {
+                // Auth States
+                const isLoggedIn = ref(false);
+                const currentUser = ref("");
+                const loginForm = ref({ username: "", password: "" });
+                const loginError = ref("");
+
+                // App States
+                const stockData = ref([]);
+                const salesMap = ref({});
+                const putawayMap = ref({});
+                const putawayCount = ref(0);
+                const excludeInput = ref("TP01, Room, RM, BE, BD, BF, BG, CA, CP");
+                const thresholdPercent = ref(10);
+                const search = ref("");
+                const sortBySales = ref(false);
+
+                // 登入邏輯
+                const handleLogin = () => {
+                    loginError.value = "";
+                    if (loginForm.value.username === AUTH_CONFIG.username && loginForm.value.password === AUTH_CONFIG.password) {
+                        isLoggedIn.value = true;
+                        currentUser.value = loginForm.value.username;
+                        loginForm.value = { username: "", password: "" };
+                    } else {
+                        loginError.value = "帳號或密碼錯誤，請重新輸入！";
+                    }
+                };
+
+                const handleLogout = () => {
+                    isLoggedIn.value = false;
+                    currentUser.value = "";
+                };
+
+                const excludeList = computed(() => {
+                    return excludeInput.value.split(',').map(s => s.trim().toLowerCase()).filter(s => s.length > 0);
+                });
+
+                const getLocTier = (loc) => {
+                    const m = String(loc).trim().match(/[-_]?(\d+)$/);
+                    return m ? parseInt(m[1], 10) : 99;
+                };
+
+                const parseFile = (file, callback) => {
+                    const filename = file.name.toLowerCase();
+                    if (filename.endsWith('.xlsx') || filename.endsWith('.xls')) {
+                        const reader = new FileReader();
+                        reader.onload = (evt) => {
+                            const bstr = evt.target.result;
+                            const wb = XLSX.read(bstr, { type: 'binary' });
+                            const wsname = wb.SheetNames[0];
+                            const ws = wb.Sheets[wsname];
+                            callback(XLSX.utils.sheet_to_json(ws, { defval: "" }));
+                        };
+                        reader.readAsBinaryString(file);
+                    } else {
+                        Papa.parse(file, {
+                            header: true,
+                            skipEmptyLines: true,
+                            complete: (results) => { callback(results.data); }
+                        });
+                    }
+                };
+
+                // 1. 上傳庫存
+                const handleStockUpload = (e) => {
+                    const file = e.target.files[0];
+                    if (!file) return;
+                    parseFile(file, (data) => { stockData.value = data; });
+                };
+
+                // 2. 上傳昨日出貨
+                const handleSalesUpload = (e) => {
+                    const file = e.target.files[0];
+                    if (!file) return;
+                    parseFile(file, (data) => {
+                        const map = {};
+                        data.forEach(row => {
+                            const key = String(row['Barcode'] || row['條碼'] || row['SKU编码'] || row['SKU'] || '').trim();
+                            const qty = parseFloat(row['出庫數量'] || row['出货数量'] || row['出货量'] || row['数量'] || row['Qty'] || row['Quantity'] || 1) || 0;
+                            if (key) map[key] = (map[key] || 0) + qty;
+                        });
+                        salesMap.value = map;
+                    });
+                };
+
+                // 3. 上傳上架流水 (過濾：Barcode, SKU編碼, 入庫上架, 操作時間)
+                const handlePutawayUpload = (e) => {
+                    const file = e.target.files[0];
+                    if (!file) return;
+                    parseFile(file, (data) => {
+                        const map = {};
+                        let count = 0;
+
+                        data.forEach(row => {
+                            const loc = String(row['库位'] || row['庫位'] || row['Location'] || row['Loc'] || '').trim();
+                            const barcode = String(row['Barcode'] || row['條碼'] || '').trim();
+                            const sku = String(row['SKU编码'] || row['SKU編碼'] || row['SKU'] || '').trim();
+                            const opType = String(row['入庫上架'] || row['入库上架'] || row['作業類型'] || row['作业类型'] || row['操作类型'] || row['Type'] || row['Status'] || '').trim();
+                            const rawTime = row['操作時間'] || row['操作时间'] || row['PutawayTime'] || row['Date'] || row['時間'] || row['时间'];
+
+                            const isPutawayAction = !opType || /上架|入庫|入库|putaway|inbound/i.test(opType);
+
+                            if (loc && (barcode || sku) && rawTime && isPutawayAction) {
+                                const parsedDate = new Date(rawTime);
+                                const timeStamp = isNaN(parsedDate.getTime()) ? 0 : parsedDate.getTime();
+
+                                const itemKeys = [];
+                                if (barcode) itemKeys.push(`${loc}_${barcode}`);
+                                if (sku) itemKeys.push(`${loc}_${sku}`);
+
+                                itemKeys.forEach(mapKey => {
+                                    if (!map[mapKey] || timeStamp < map[mapKey].timeStamp) {
+                                        map[mapKey] = {
+                                            timeStamp: timeStamp,
+                                            rawTimeStr: String(rawTime)
+                                        };
+                                    }
+                                });
+                                count++;
+                            }
+                        });
+
+                        putawayMap.value = map;
+                        putawayCount.value = count;
+                    });
+                };
+
+                const filteredStockData = computed(() => {
+                    if (!excludeList.value.length) return stockData.value;
+                    return stockData.value.filter(row => {
+                        const loc = String(row['库位'] || row['庫位'] || '').toLowerCase();
+                        return !excludeList.value.some(kw => loc.includes(kw));
+                    });
+                });
+
+                const skuSummary = computed(() => {
+                    const map = {};
+                    filteredStockData.value.forEach(row => {
+                        const barcode = String(row['Barcode'] || row['條碼'] || '').trim();
+                        const sku = String(row['SKU编码'] || row['SKU編碼'] || row['SKU'] || '').trim();
+                        const loc = String(row['库位'] || row['庫位'] || '').trim();
+                        const availStock = parseFloat(row['可用库存'] || row['可用庫存'] || 0) || 0;
+                        const pendingStock = parseFloat(row['已分配待出库存'] || row['已分配待出庫存'] || 0) || 0;
+
+                        if (!barcode) return;
+
+                        if (!map[barcode]) {
+                            map[barcode] = { 
+                                barcode, sku, 
+                                name: row['中文名称'] || row['中文名稱'] || row['品名'] || '', 
+                                totalStock: 0, groundStock: 0, highStock: 0,
+                                allocatedPending: 0, highLocations: []
+                            };
+                        }
+
+                        map[barcode].totalStock += availStock;
+                        map[barcode].allocatedPending += pendingStock;
+
+                        const isGround = loc.endsWith('-01') || loc.endsWith('01');
+
+                        if (isGround) {
+                            map[barcode].groundStock += availStock;
+                        } else {
+                            map[barcode].highStock += availStock;
+                            if (availStock > 0) {
+                                const pKeyBarcode = `${loc}_${barcode}`;
+                                const pKeySKU = `${loc}_${sku}`;
+                                const pInfo = putawayMap.value[pKeyBarcode] || putawayMap.value[pKeySKU];
+
+                                map[barcode].highLocations.push({
+                                    loc: loc,
+                                    qty: availStock,
+                                    tier: getLocTier(loc),
+                                    opTimeStamp: pInfo ? pInfo.timeStamp : Infinity,
+                                    opTimeStr: pInfo ? pInfo.rawTimeStr : null
+                                });
+                            }
+                        }
+                    });
+
+                    const targetRatio = thresholdPercent.value / 100;
+
+                    return Object.values(map).map(item => {
+                        const groundRatio = item.totalStock > 0 ? (item.groundStock / item.totalStock) : 0;
+                        const needReplenish = (groundRatio < targetRatio) && (item.highStock > 0);
+                        const yesterdaySales = salesMap.value[item.barcode] || salesMap.value[item.sku] || 0;
+
+                        let diffQty = 0;
+                        let pickPlan = [];
+
+                        if (needReplenish) {
+                            const ratioDiff = targetRatio - groundRatio;
+                            diffQty = Math.ceil(item.totalStock * ratioDiff);
+                            diffQty = Math.min(diffQty, item.highStock);
+
+                            const sortedHighLocs = item.highLocations.sort((a, b) => {
+                                if (a.opTimeStamp !== b.opTimeStamp) {
+                                    return a.opTimeStamp - b.opTimeStamp;
+                                }
+                                return a.tier - b.tier;
+                            });
+
+                            let remainToPick = diffQty;
+                            for (const locItem of sortedHighLocs) {
+                                if (remainToPick <= 0) break;
+                                const takeQty = Math.min(remainToPick, locItem.qty);
+                                pickPlan.push({
+                                    loc: locItem.loc,
+                                    takeQty: takeQty,
+                                    availQty: locItem.qty,
+                                    opTime: locItem.opTimeStr
+                                });
+                                remainToPick -= takeQty;
+                            }
+                        }
+
+                        return { 
+                            ...item, 
+                            groundRatio, 
+                            needReplenish, 
+                            yesterdaySales,
+                            suggestedReplenish: diffQty,
+                            pickPlan
+                        };
+                    });
+                });
+
+                const totalSKUs = computed(() => Object.keys(skuSummary.value).length);
+                const totalGroundStock = computed(() => skuSummary.value.reduce((acc, cur) => acc + cur.groundStock, 0));
+                
+                const replenishList = computed(() => {
+                    return skuSummary.value.filter(item => item.needReplenish);
+                });
+
+                const totalSuggestedReplenish = computed(() => {
+                    return replenishList.value.reduce((acc, cur) => acc + cur.suggestedReplenish, 0);
+                });
+
+                const filteredList = computed(() => {
+                    let list = replenishList.value;
+
+                    if (search.value.trim()) {
+                        const q = search.value.trim().toLowerCase();
+                        list = list.filter(i => 
+                            i.barcode.toLowerCase().includes(q) || 
+                            i.sku.toLowerCase().includes(q) || 
+                            i.name.toLowerCase().includes(q)
+                        );
+                    }
+
+                    if (sortBySales.value) {
+                        return [...list].sort((a, b) => b.yesterdaySales - a.yesterdaySales);
+                    }
+
+                    return list;
+                });
+
+                // 導出 CSV 任務單
+                const exportCSV = () => {
+                    if (!replenishList.value.length) return;
+
+                    const exportData = [];
+                    replenishList.value.forEach(item => {
+                        const locs = item.pickPlan.map(p => p.loc).join(', ');
+                        exportData.push({
+                            'Barcode': item.barcode,
+                            'SKU編碼': item.sku,
+                            '品名': item.name,
+                            '昨日出貨量': item.yesterdaySales,
+                            '總庫存': item.totalStock,
+                            '地下可用庫存': item.groundStock,
+                            '地下佔比': (item.groundRatio * 100).toFixed(1) + '%',
+                            '建議下架總量': item.suggestedReplenish,
+                            '建議下架庫位(FIFO)': locs
+                        });
+                    });
+
+                    const csv = Papa.unparse(exportData);
+                    const blob = new Blob(["\uFEFF" + csv], { type: 'text/csv;charset=utf-8;' });
+                    const link = document.createElement("a");
+                    link.href = URL.createObjectURL(blob);
+                    link.setAttribute("download", `WMS_Replenishment_Task_FIFO_${new Date().toISOString().slice(0,10)}.csv`);
+                    document.body.appendChild(link);
+                    link.click();
+                    document.body.removeChild(link);
+                };
+
+                return {
+                    isLoggedIn, currentUser, loginForm, loginError, handleLogin, handleLogout,
+                    stockData, salesMap, putawayMap, putawayCount, excludeInput, thresholdPercent, search, sortBySales,
+                    excludeList, totalSKUs, totalGroundStock, replenishList, totalSuggestedReplenish,
+                    filteredList, handleStockUpload, handleSalesUpload, handlePutawayUpload, exportCSV
+                };
+            }
+        }).mount('#app');
+    </script>
+</body>
+</html>
